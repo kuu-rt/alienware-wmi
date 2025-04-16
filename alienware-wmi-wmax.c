@@ -1002,14 +1002,14 @@ static int awcc_platform_profile_probe(void *drvdata, unsigned long *choices)
 
 	for (unsigned int i = 0; i < priv->profile_count; i++) {
 		ret = awcc_op_get_resource_id(priv->wdev, i + offset, &id);
-		if (ret == -EIO)
-			return ret;
 		/*
 		 * Some devices report an incorrect number of thermal profiles
 		 * so the resource ID list may end prematurely
 		 */
 		if (ret == -EBADRQC)
 			break;
+		if (ret)
+			return ret;
 
 		if (!is_awcc_thermal_profile_id(id)) {
 			dev_dbg(&priv->wdev->dev, "Unmapped thermal profile ID 0x%02x\n", id);
