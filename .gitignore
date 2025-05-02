@@ -4,3 +4,6 @@
 *.mod*
 modules.order
 Module.symvers
+compile_commands.json
+.clangd
+.cache
