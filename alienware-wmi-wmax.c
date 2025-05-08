@@ -2,7 +2,6 @@
 /*
  * Alienware WMAX WMI device driver
  *
- * Copyright (C) 2014 Dell Inc <Dell.Client.Kernel@dell.com>
  * Copyright (C) 2025 Kurt Borja <kuurtb@gmail.com>
  */
 
