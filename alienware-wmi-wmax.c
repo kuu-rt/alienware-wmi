@@ -16,6 +16,7 @@
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/kstrtox.h>
+#include <linux/kobject.h>
 #include <linux/minmax.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_profile.h>
@@ -23,6 +24,8 @@
 #include <linux/seq_file.h>
 #include <linux/units.h>
 #include <linux/wmi.h>
+
+#include "firmware_attributes_class.h"
 
 #define WMAX_CONTROL_GUID		"A70591CE-A997-11DA-B012-B622A1EF5492"
 
@@ -38,6 +41,7 @@
 #define AWCC_METHOD_GET_FAN_SENSORS		0x13
 #define AWCC_METHOD_THERMAL_INFORMATION		0x14
 #define AWCC_METHOD_THERMAL_CONTROL		0x15
+#define AWCC_METHOD_TCC_CONTROL			0x1E
 #define AWCC_METHOD_FWUP_GPIO_CONTROL		0x20
 #define AWCC_METHOD_READ_TOTAL_GPIOS		0x21
 #define AWCC_METHOD_READ_GPIO_STATUS		0x22
@@ -72,6 +76,7 @@ struct awcc_quirks {
 	bool hwmon;
 	bool pprof;
 	bool gmode;
+	bool tcc;
 };
 
 static struct awcc_quirks g_series_quirks = {
@@ -86,6 +91,12 @@ static struct awcc_quirks generic_quirks = {
 	.gmode = false,
 };
 
+static struct awcc_quirks full_quirks = {
+	.hwmon = true,
+	.pprof = true,
+	.tcc = true,
+};
+
 static struct awcc_quirks empty_quirks;
 
 static const struct dmi_system_id awcc_dmi_table[] __initconst = {
@@ -95,7 +106,7 @@ static const struct dmi_system_id awcc_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Alienware"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "Alienware m16 R1 AMD"),
 		},
-		.driver_data = &generic_quirks,
+		.driver_data = &full_quirks,
 	},
 	{
 		.ident = "Alienware m17 R5",
@@ -119,7 +130,7 @@ static const struct dmi_system_id awcc_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Alienware"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "Alienware x15 R1"),
 		},
-		.driver_data = &generic_quirks,
+		.driver_data = &full_quirks,
 	},
 	{
 		.ident = "Alienware x17 R2",
@@ -199,6 +210,13 @@ enum AWCC_THERMAL_INFORMATION_OPERATIONS {
 enum AWCC_THERMAL_CONTROL_OPERATIONS {
 	AWCC_OP_ACTIVATE_PROFILE		= 0x01,
 	AWCC_OP_SET_FAN_BOOST			= 0x02,
+};
+
+enum AWCC_TCC_CONTROL_OPERATIONS {
+	AWCC_OP_GET_MAX_TCC			= 0x01,
+	AWCC_OP_GET_MAX_TCC_OFFSET		= 0x02,
+	AWCC_OP_GET_TCC_OFFSET			= 0x03,
+	AWCC_OP_SET_TCC_OFFSET			= 0x04,
 };
 
 enum AWCC_GAME_SHIFT_STATUS_OPERATIONS {
@@ -289,6 +307,10 @@ struct awcc_priv {
 	struct device *hwdev;
 	struct awcc_fan_data **fan_data;
 	unsigned long temp_sensors[AWCC_ID_BITMAP_LONGS];
+
+	struct device *fadev;
+	struct kset *attrs_kset;
+	u32 tcc_max;
 
 	u32 gpio_count;
 };
@@ -549,6 +571,43 @@ static int awcc_op_set_fan_boost(struct wmi_device *wdev, u8 fan_id, u8 boost)
 	u32 out;
 
 	return awcc_wmi_command(wdev, AWCC_METHOD_THERMAL_CONTROL, &args, &out);
+}
+
+static int awcc_op_get_tcc_max_offset(struct wmi_device *wdev, u32 *value)
+{
+	struct wmax_u32_args args = {
+		.operation = AWCC_OP_GET_MAX_TCC_OFFSET,
+		.arg1 = 0,
+		.arg2 = 0,
+		.arg3 = 0,
+	};
+
+	return awcc_wmi_command(wdev, AWCC_METHOD_TCC_CONTROL, &args, value);
+}
+
+static int awcc_op_get_tcc_offset(struct wmi_device *wdev, u32 *value)
+{
+	struct wmax_u32_args args = {
+		.operation = AWCC_OP_GET_TCC_OFFSET,
+		.arg1 = 0,
+		.arg2 = 0,
+		.arg3 = 0,
+	};
+
+	return awcc_wmi_command(wdev, AWCC_METHOD_TCC_CONTROL, &args, value);
+}
+
+static int awcc_op_set_tcc_offset(struct wmi_device *wdev, u32 value)
+{
+	struct wmax_u32_args args = {
+		.operation = AWCC_OP_SET_TCC_OFFSET,
+		.arg1 = value,
+		.arg2 = 0,
+		.arg3 = 0,
+	};
+	u32 out;
+
+	return awcc_wmi_command(wdev, AWCC_METHOD_TCC_CONTROL, &args, &out);
 }
 
 /*
@@ -1122,6 +1181,155 @@ static int awcc_platform_profile_init(struct wmi_device *wdev)
 }
 
 /*
+ * Firmware Attributes
+ */
+static ssize_t current_value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct device *dev = container_of(kobj->parent, struct device, kobj);
+	struct awcc_priv *priv = dev_get_drvdata(dev);
+	u32 tcc_offset;
+	int ret;
+
+	ret = awcc_op_get_tcc_offset(priv->wdev, &tcc_offset);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", tcc_offset);
+}
+
+static ssize_t current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct device *dev = container_of(kobj->parent, struct device, kobj);
+	struct awcc_priv *priv = dev_get_drvdata(dev);
+	u32 val;
+	int ret;
+
+	ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	ret = awcc_op_set_tcc_offset(priv->wdev, clamp_val(val, 0, priv->tcc_max));
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static struct kobj_attribute current_value_attr = __ATTR(current_value, 0644, current_value_show,
+							 current_value_store);
+
+static ssize_t display_name_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "Thermal Control Circuit\n");
+}
+
+static struct kobj_attribute display_name_attr = __ATTR(display_name, 0444, display_name_show,
+							NULL);
+
+static ssize_t min_value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0\n");
+}
+
+static struct kobj_attribute min_value_attr = __ATTR(min_value, 0444, min_value_show,
+						     NULL);
+
+static ssize_t max_value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct device *dev = container_of(kobj->parent, struct device, kobj);
+	struct awcc_priv *priv = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", priv->tcc_max);
+}
+
+static struct kobj_attribute max_value_attr = __ATTR(max_value, 0444, max_value_show,
+						     NULL);
+
+static ssize_t scalar_increment_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "1\n");
+}
+
+static struct kobj_attribute scalar_increment_attr = __ATTR(scalar_increment, 0444,
+							    scalar_increment_show, NULL);
+
+static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "integer\n");
+}
+
+static struct kobj_attribute type_attr = __ATTR(type, 0444, type_show, NULL);
+
+static struct attribute *tcc_attrs[] = {
+	&type_attr.attr,
+	&current_value_attr.attr,
+	&min_value_attr.attr,
+	&max_value_attr.attr,
+	&scalar_increment_attr.attr,
+	&display_name_attr.attr,
+	NULL
+};
+
+static struct attribute_group tcc_group = {
+	.name = "tcc",
+	.attrs = tcc_attrs,
+};
+__ATTRIBUTE_GROUPS(tcc);
+
+static void awcc_fw_attrs_remove(void *data)
+{
+	struct awcc_priv *priv = data;
+
+	device_unregister(priv->fadev);
+	kset_unregister(priv->attrs_kset);
+}
+
+static int awcc_fw_attrs_init(struct wmi_device *wdev)
+{
+	struct awcc_priv *priv = dev_get_drvdata(&wdev->dev);
+	struct kset *attrs_kset;
+	struct device *dev;
+	int ret;
+
+	dev = device_create(&firmware_attributes_class, &wdev->dev, MKDEV(0, 0),
+			    priv, "alienware-wmi");
+	if (IS_ERR(dev))
+		return PTR_ERR(dev);
+	dev_set_drvdata(dev, priv);
+	priv->fadev = dev;
+
+	ret = devm_add_action_or_reset(&wdev->dev, awcc_fw_attrs_remove, priv);
+	if (ret)
+		goto out_unregister_device;
+
+	attrs_kset = kset_create_and_add("attributes", NULL, &dev->kobj);
+	if (!attrs_kset) {
+		ret = -ENOMEM;
+		goto out_unregister_device;
+	}
+	priv->attrs_kset = attrs_kset;
+
+	ret = awcc_op_get_tcc_max_offset(priv->wdev, &priv->tcc_max);
+	if (ret)
+		goto out_unregister_kset;
+
+	ret = sysfs_create_groups(&attrs_kset->kobj, tcc_groups);
+	if (ret)
+		goto out_unregister_kset;
+
+	return 0;
+
+out_unregister_kset:
+	kset_unregister(attrs_kset);
+
+out_unregister_device:
+	device_unregister(dev);
+
+	return ret;
+}
+
+/*
  * DebugFS
  */
 static int awcc_debugfs_system_description_read(struct seq_file *seq, void *data)
@@ -1306,6 +1514,12 @@ static int alienware_awcc_setup(struct wmi_device *wdev)
 
 	if (awcc->pprof) {
 		ret = awcc_platform_profile_init(wdev);
+		if (ret)
+			return ret;
+	}
+
+	if (awcc->tcc) {
+		ret = awcc_fw_attrs_init(wdev);
 		if (ret)
 			return ret;
 	}
