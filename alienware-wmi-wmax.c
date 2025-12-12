@@ -1421,3 +1421,4 @@ module_exit(alienware_wmax_wmi_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kurt Borja <kuurtb@gmail.com");
+MODULE_DESCRIPTION("𖹭.ᐟ");
